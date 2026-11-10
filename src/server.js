@@ -1,0 +1,222 @@
+const app = require("./app");
+const env = require("./config/env");
+const logger = require("./utils/logger");
+const prisma = require("./config/prisma");
+const { initBackupScheduler } = require("./modules/backup/services/backupScheduler.service");
+const { ensureDefaultSettings } = require("./modules/settings/services/setting.service");
+const { cleanupLegacyComputerCatalog } = require("./utils/catalogPurge");
+const { importPharmacyAndDeviceCatalog } = require("./utils/pharmacyCatalogImporter");
+const bcrypt = require("bcryptjs");
+
+const ensureSchemaMigrations = async () => {
+  const migrations = [
+    `ALTER TABLE "QuotationItem" ADD COLUMN IF NOT EXISTS "warrantyDuration" TEXT;`,
+    `ALTER TABLE "SaleItem" ADD COLUMN IF NOT EXISTS "warrantyDuration" TEXT;`,
+    `ALTER TABLE "IncentiveAccountConfigVersion" ADD COLUMN IF NOT EXISTS "soloSaleEnabled" BOOLEAN NOT NULL DEFAULT false;`,
+    `ALTER TABLE "IncentiveAccountConfigVersion" ADD COLUMN IF NOT EXISTS "soloSaleRatePercent" DECIMAL(7,4);`,
+    `ALTER TABLE "IncentiveAccountConfigVersion" ADD COLUMN IF NOT EXISTS "pcBuildEnabled" BOOLEAN NOT NULL DEFAULT false;`,
+    `ALTER TABLE "IncentiveAccountConfigVersion" ADD COLUMN IF NOT EXISTS "pcBuildRatePercent" DECIMAL(7,4);`,
+    `ALTER TABLE "IncentiveAccountConfigVersion" ADD COLUMN IF NOT EXISTS "ordinaryPartsRepairEnabled" BOOLEAN NOT NULL DEFAULT false;`,
+    `ALTER TABLE "IncentiveAccountConfigVersion" ADD COLUMN IF NOT EXISTS "ordinaryPartsRepairRatePercent" DECIMAL(7,4);`,
+    `ALTER TABLE "IncentiveAccountConfigVersion" ADD COLUMN IF NOT EXISTS "boardPartsRepairEnabled" BOOLEAN NOT NULL DEFAULT false;`,
+    `ALTER TABLE "IncentiveAccountConfigVersion" ADD COLUMN IF NOT EXISTS "boardPartsRepairRatePercent" DECIMAL(7,4);`,
+    `ALTER TABLE "ServiceJob" DROP CONSTRAINT IF EXISTS "ServiceJob_financial_snapshot_check";`,
+    `ALTER TABLE "ServiceJob" DROP CONSTRAINT IF EXISTS "ServiceJob_service_pricing_check";`,
+  ];
+
+  for (const sql of migrations) {
+    try {
+      await prisma.$executeRawUnsafe(sql);
+    } catch (err) {
+      logger.warn("Database schema migration statement warning", { sql, error: err.message });
+    }
+  }
+  logger.info("Database schema self-check completed");
+};
+
+const ensureDefaultBranches = async () => {
+  try {
+    // 1. Ensure Main Branch exists with name "Main Branch"
+    await prisma.branch.upsert({
+      where: { code: "MAIN" },
+      update: { name: "Main Branch", status: "ACTIVE" },
+      create: {
+        code: "MAIN",
+        name: "Main Branch",
+        address: "Med C Drugstore, Main Blvd.",
+        contactNo: "09123456789",
+        status: "ACTIVE",
+      },
+    });
+
+    // 2. Ensure Branch 1 exists and rename any existing Mabalacat Branch to Branch 1
+    const mabBranch = await prisma.branch.findUnique({ where: { code: "MAB" } });
+    if (mabBranch) {
+      await prisma.branch.update({
+        where: { code: "MAB" },
+        data: { name: "Branch 1", address: "Med C Drugstore, Branch 1" },
+      });
+    } else {
+      await prisma.branch.upsert({
+        where: { code: "BR1" },
+        update: { name: "Branch 1", status: "ACTIVE" },
+        create: {
+          code: "BR1",
+          name: "Branch 1",
+          address: "Med C Drugstore, Branch 1",
+          contactNo: "09987654321",
+          status: "ACTIVE",
+        },
+      });
+    }
+
+    // Rename any branch whose name is still "Mabalacat Branch" to "Branch 1"
+    await prisma.branch.updateMany({
+      where: { name: "Mabalacat Branch" },
+      data: { name: "Branch 1" },
+    });
+
+    logger.info("Default branches synchronized successfully: Main Branch, Branch 1");
+  } catch (err) {
+    logger.warn("Default branches sync warning", { error: err.message });
+  }
+};
+
+const ensureDeveloperAccount = async () => {
+  try {
+    const existingSuperOwner = await prisma.user.findFirst({
+      where: {
+        role: "SUPER_OWNER",
+      },
+    });
+
+    if (existingSuperOwner) {
+      logger.info("Main Admin (SUPER_OWNER) account already exists; preserving user credentials");
+      return;
+    }
+
+    const username = "calix";
+    const plainPassword = "calixdaven";
+    const passwordHash = await bcrypt.hash(plainPassword, 12);
+
+    const existing = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { username: "calix" },
+          { email: "calix@pointify.local" },
+          { email: "calix@arunafeltz.local" }
+        ]
+      }
+    });
+
+    if (existing) {
+      await prisma.user.update({
+        where: { id: existing.id },
+        data: {
+          role: "SUPER_OWNER",
+          status: "ACTIVE",
+          branchId: null,
+        }
+      });
+      logger.info("Default Main Admin account verified");
+    } else {
+      await prisma.user.create({
+        data: {
+          username,
+          email: null,
+          firstName: "Main",
+          lastName: "Admin",
+          fullName: "Main Admin",
+          role: "SUPER_OWNER",
+          status: "ACTIVE",
+          passwordHash,
+          branchId: null,
+        }
+      });
+      logger.info("Default Main Admin account created successfully");
+    }
+  } catch (err) {
+    logger.warn("Developer account sync warning", { error: err.message });
+  }
+};
+
+const server = app.listen(env.port, () => {
+  logger.info("Pointify Backend API started", {
+    port: env.port,
+    environment: env.nodeEnv,
+  });
+  initBackupScheduler();
+  ensureSchemaMigrations();
+  ensureDeveloperAccount();
+  ensureDefaultBranches();
+  cleanupLegacyComputerCatalog();
+  importPharmacyAndDeviceCatalog().catch((err) => {
+    logger.warn("Pharmacy and device catalog import warning", { error: err?.message });
+  });
+  ensureDefaultSettings().catch((err) => {
+    logger.warn("Initial settings sync warning", { error: err.message });
+  });
+  try {
+    const { cleanupExpiredQuotations } = require("./modules/quotations/services/quotation.service");
+    cleanupExpiredQuotations().catch((err) => {
+      logger.warn("Initial quotation cleanup warning", { error: err.message });
+    });
+    const quotationCleanupInterval = setInterval(() => {
+      cleanupExpiredQuotations().catch(() => {});
+    }, 12 * 60 * 60 * 1000);
+    quotationCleanupInterval.unref();
+  } catch (err) {
+    logger.warn("Could not initialize quotation cleanup scheduler", { error: err.message });
+  }
+});
+
+let isShuttingDown = false;
+
+const shutdown = (signal, exitCode = 0) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  logger.info("Backend shutdown started", { signal });
+
+  const forceTimer = setTimeout(() => {
+    logger.error("Backend shutdown timed out", { signal });
+    process.exit(1);
+  }, 10000);
+  forceTimer.unref();
+
+  server.close(async (closeError) => {
+    try {
+      await prisma.$disconnect();
+    } catch (disconnectError) {
+      logger.error("Database disconnect failed", { message: disconnectError.message });
+      exitCode = 1;
+    }
+
+    if (closeError) {
+      logger.error("HTTP server close failed", { message: closeError.message });
+      exitCode = 1;
+    }
+    process.exit(exitCode);
+  });
+};
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+process.on("unhandledRejection", (error) => {
+  logger.error("Unhandled promise rejection", {
+    message: error.message,
+    stack: error.stack,
+  });
+
+  shutdown("unhandledRejection", 1);
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception", {
+    message: error.message,
+    stack: error.stack,
+  });
+
+  process.exit(1);
+});
+
